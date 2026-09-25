@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2312,4 +2312,268 @@ def chapter_export(req: ChapterRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="chapters.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 字幕空隙提示编排
+
+class HintRequest(BaseModel):
+    srt: str
+    hints: str  # 逐行提示：目标起点 持续毫秒 正文
+
+
+MAX_HINT_GRID = 2_000_000  # 提示条数 × 空隙数 的匹配计算规模上限
+
+
+def _parse_hint_lines(text: str) -> List[dict]:
+    """逐行解析提示：每行「目标起点 持续毫秒 正文」三段（空白分隔）。
+
+    空行跳过；时间复用 parse_time（HH:MM:SS,mmm），持续毫秒须为正整数，
+    正文为行内剩余部分、去首尾空白后不得为空。返回
+    [{row, target, duration, text}]（row 为输入行号，1 起）。
+    """
+    out = []
+    for i, line in enumerate(
+        text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1
+    ):
+        if not line.strip():
+            continue
+        parts = line.split(None, 2)  # 目标起点 / 持续毫秒 / 正文（可含空白）
+        if len(parts) < 3 or not parts[2].strip():
+            raise ValueError(
+                f"提示第 {i} 行：须为「目标起点 持续毫秒 正文」三段，且正文不能为空"
+            )
+        try:
+            target = parse_time(parts[0])
+        except ValueError as e:
+            raise ValueError(f"提示第 {i} 行：{e}")
+        if not parts[1].isdigit() or int(parts[1]) <= 0:
+            raise ValueError(f"提示第 {i} 行：持续毫秒须为正整数")
+        out.append({
+            "row": i,
+            "target": target,
+            "duration": int(parts[1]),
+            "text": parts[2].strip(),
+        })
+    if not out:
+        raise ValueError("请至少填写 1 条提示（每行：目标起点 持续毫秒 正文）")
+    return out
+
+
+def plan_hint_placement(entries: List[dict], hints: List[dict]):
+    """空隙提示编排的有序全局匹配规划。
+
+    空隙 = 相邻原字幕之间的正时长间隔（轨道校验已保证无重叠，故间隔非负，
+    仅取严格为正者），每个空隙最多放入一条提示。提示按 (目标起点, 输入行号)
+    排序后与空隙做保序全局匹配；提示 i 可放入空隙 j 当且仅当
+    空隙时长 ≥ 提示持续毫秒，此时实际起点把目标起点夹到
+    [空隙起点, 空隙终点 - 持续] 范围，偏差 = |实际起点 - 目标起点|。
+    三级目标依次为：
+      1) 放入条数最多；
+      2) 已放入提示的偏差之和最小；
+      3) 已用空隙序号（1 起，升序）序列字典序最小。
+
+    与双语合成相同，三级目标编码为单个整数：放入一对的权重为
+        CNT_UNIT | (DMAX - 偏差) << G | 空隙序号位（首个空隙为最高位），
+    其中 DMAX 为偏差总和的严格上界、G 为空隙数；等条数时偏差位严格优先于
+    序号位，等条数等偏差时权重比较即空隙集合指示向量的比较，等价于空隙
+    序号序列字典序最小。保序网格 DP 求最大权重，值相等时解的空隙集合
+    相同（保序匹配下空隙集合唯一决定分配），回溯取任意最大转移即可。
+
+    返回 (gaps, placed, unplaced)：gaps 为全部正时长空隙（含使用情况）；
+    placed / unplaced 均按提示排序顺序，placed 含实际起止、偏差与所在空隙。
+    """
+    gaps = []
+    for k in range(len(entries) - 1):
+        gs, ge = entries[k]["end"], entries[k + 1]["start"]
+        if ge > gs:  # 仅正时长空隙可用
+            gaps.append({
+                "seq": len(gaps) + 1,
+                "start": gs,
+                "end": ge,
+                "prev_index": entries[k]["index"],
+                "next_index": entries[k + 1]["index"],
+                "used": False,
+            })
+    ordered = sorted(hints, key=lambda h: (h["target"], h["row"]))
+    h_n, g_n = len(ordered), len(gaps)
+    if g_n == 0:
+        return gaps, [], ordered
+    if h_n * g_n > MAX_HINT_GRID:
+        raise ValueError(
+            f"提示条数 × 空隙数（{h_n}×{g_n}）超过匹配计算上限 "
+            f"{MAX_HINT_GRID}，请确认输入规模后裁短再试"
+        )
+
+    t_max = max([h["target"] for h in ordered]
+                + [g["end"] for g in gaps] + [1])
+    dmax = h_n * t_max + 1            # 偏差总和的严格上界
+    dev_unit = 1 << g_n               # 序号位掩码占 G 个二进制位
+    cnt_unit = (dmax + 1) << g_n      # 条数位严格高于偏差位
+    gap_bit = [1 << (g_n - 1 - j) for j in range(g_n)]
+
+    TAG_UP, TAG_LEFT, TAG_DIAG = 0, 1, 2  # 跳过提示 / 跳过空隙 / 放入
+    width = g_n + 1
+    tags = bytearray((h_n + 1) * width)
+    prev = [0] * width
+    for i in range(1, h_n + 1):
+        cur = [0] * width
+        t_i = ordered[i - 1]["target"]
+        d_i = ordered[i - 1]["duration"]
+        base = i * width
+        for j in range(1, g_n + 1):
+            best = prev[j]  # 跳过提示 i-1
+            tag = TAG_UP
+            if cur[j - 1] > best:  # 跳过空隙 j-1
+                best, tag = cur[j - 1], TAG_LEFT
+            g = gaps[j - 1]
+            if g["end"] - g["start"] >= d_i:
+                # 实际起点夹到 [空隙起点, 空隙终点 - 持续]
+                actual = t_i if t_i > g["start"] else g["start"]
+                latest = g["end"] - d_i
+                if actual > latest:
+                    actual = latest
+                dev = actual - t_i
+                if dev < 0:
+                    dev = -dev
+                cand = prev[j - 1] + cnt_unit + (dmax - dev) * dev_unit \
+                    + gap_bit[j - 1]
+                if cand > best:
+                    best, tag = cand, TAG_DIAG
+            cur[j] = best
+            tags[base + j] = tag
+        prev = cur
+
+    placement = {}  # 排序后提示下标 -> (空隙下标, 实际起点, 偏差)
+    i, j = h_n, g_n
+    while i > 0:
+        tag = tags[i * width + j] if j > 0 else TAG_UP
+        if tag == TAG_DIAG:
+            g = gaps[j - 1]
+            t_i = ordered[i - 1]["target"]
+            d_i = ordered[i - 1]["duration"]
+            actual = t_i if t_i > g["start"] else g["start"]
+            latest = g["end"] - d_i
+            if actual > latest:
+                actual = latest
+            placement[i - 1] = (j - 1, actual, abs(actual - t_i))
+            i -= 1
+            j -= 1
+        elif tag == TAG_LEFT:
+            j -= 1
+        else:
+            i -= 1
+
+    placed, unplaced = [], []
+    for k, h in enumerate(ordered):
+        if k in placement:
+            gj, actual, dev = placement[k]
+            gaps[gj]["used"] = True
+            placed.append({
+                **h,
+                "start": actual,
+                "end": actual + h["duration"],
+                "deviation_ms": dev,
+                "gap": gaps[gj]["seq"],
+            })
+        else:
+            unplaced.append(h)
+    return gaps, placed, unplaced
+
+
+def _hint_prepare(req: "HintRequest"):
+    """空隙提示编排公共预处理：解析并校验轨道与提示行、求编排方案，失败抛 400。"""
+    try:
+        entries = parse_srt(req.srt)
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        hints = _parse_hint_lines(req.hints)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        gaps, placed, unplaced = plan_hint_placement(entries, hints)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, hints, gaps, placed, unplaced
+
+
+def _hint_gap_payload(g: dict) -> dict:
+    return {
+        "seq": g["seq"],
+        "start": fmt_time(g["start"]),
+        "end": fmt_time(g["end"]),
+        "start_ms": g["start"],
+        "end_ms": g["end"],
+        "duration_ms": g["end"] - g["start"],
+        "prev_index": g["prev_index"],
+        "next_index": g["next_index"],
+        "used": g["used"],
+    }
+
+
+def _hint_placed_payload(p: dict) -> dict:
+    return {
+        "row": p["row"],
+        "target": fmt_time(p["target"]),
+        "target_ms": p["target"],
+        "duration_ms": p["duration"],
+        "start": fmt_time(p["start"]),
+        "end": fmt_time(p["end"]),
+        "start_ms": p["start"],
+        "end_ms": p["end"],
+        "deviation_ms": p["deviation_ms"],
+        "gap": p["gap"],
+        "text": p["text"],
+    }
+
+
+def _hint_unplaced_payload(h: dict) -> dict:
+    return {
+        "row": h["row"],
+        "target": fmt_time(h["target"]),
+        "target_ms": h["target"],
+        "duration_ms": h["duration"],
+        "text": h["text"],
+    }
+
+
+@app.post("/api/hint/preview")
+def hint_preview(req: HintRequest):
+    entries, hints, gaps, placed, unplaced = _hint_prepare(req)
+    return {
+        "entry_count": len(entries),
+        "gap_count": len(gaps),
+        "hint_count": len(hints),
+        "placed_count": len(placed),
+        "unplaced_count": len(unplaced),
+        "total_deviation_ms": sum(p["deviation_ms"] for p in placed),
+        "gaps": [_hint_gap_payload(g) for g in gaps],
+        "placed": [_hint_placed_payload(p) for p in placed],
+        "unplaced": [_hint_unplaced_payload(h) for h in unplaced],
+    }
+
+
+@app.post("/api/hint/export")
+def hint_export(req: HintRequest):
+    entries, _hints, _gaps, placed, _unplaced = _hint_prepare(req)
+    blocks = [
+        {"start": e["start"], "end": e["end"], "lines": e["lines"], "hint": 0}
+        for e in entries
+    ] + [
+        {"start": p["start"], "end": p["end"], "lines": [p["text"]], "hint": 1}
+        for p in placed
+    ]
+    # 提示严格落在空隙内，与原字幕互不重叠；按时间排序后从 1 连续重编号
+    blocks.sort(key=lambda b: (b["start"], b["end"], b["hint"]))
+    content = "\n\n".join(
+        f"{n}\n{fmt_time(b['start'])} --> {fmt_time(b['end'])}\n"
+        + "\n".join(b["lines"] or [""])
+        for n, b in enumerate(blocks, 1)
+    ) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="hinted.srt"'},
     )

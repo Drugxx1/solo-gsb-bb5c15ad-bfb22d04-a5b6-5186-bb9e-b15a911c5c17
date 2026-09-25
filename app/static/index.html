@@ -360,6 +360,41 @@
   <div id="chResult"></div>
 </div>
 
+<hr class="feature-divider">
+<h1 id="hint">字幕空隙提示编排</h1>
+<p class="hint">粘贴或上传 SRT，并<strong>逐行填写提示</strong>（每行三段：<code>目标起点 持续毫秒 正文</code>，以空白分隔，如 <code>00:00:05,000 1500 请注意画面</code>）。
+只使用<strong>相邻原字幕之间的正时长空隙</strong>，每个空隙最多放入一条提示；提示按<strong>目标起点、输入行号</strong>排序后与空隙做<strong>有序全局匹配</strong>：
+先<strong>最大化放入条数</strong>，再<strong>最小化实际起点与目标起点的绝对偏差之和</strong>（每条提示的实际起点在候选空隙内夹到可用范围），仍并列时取<strong>空隙序号序列字典序最小</strong>的方案。
+放入的提示不与原字幕重叠，原字幕时间保持不变。SRT 出现<strong>空时长、起止倒置或轨内重叠</strong>，或提示行<strong>时间非法、持续毫秒非正整数、正文为空</strong>都会报错。
+预览显示已放入位置、偏差与未放入提示，确认后可下载<strong>按时间重编号</strong>的 SRT（原字幕正文与时间原样保留）。</p>
+
+<div class="card">
+  <h2>18. SRT 与逐行提示</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>SRT 字幕
+        <input type="file" id="hintFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="hintSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:05,000 --> 00:00:07,000&#10;第二句字幕"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>逐行提示（目标起点 持续毫秒 正文）</h3>
+      <textarea id="hintLines" style="min-height:200px" placeholder="00:00:04,000 800 第一条提示正文&#10;00:00:08,500 1200 第二条提示正文"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>19. 预览编排与下载 SRT</h2>
+  <div class="toolbar">
+    <button onclick="hintPreview()">预览编排结果</button>
+    <button id="hintExportBtn" onclick="hintExport()" disabled>下载编排后 SRT</button>
+    <span class="hint" id="hintExportHint">请先预览，校验通过后才能下载</span>
+  </div>
+  <div id="hintMessage"></div>
+  <div id="hintResult"></div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
@@ -1306,6 +1341,123 @@ async function chapterExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "chapters.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 字幕空隙提示编排
+
+bindTrackFile("hintFile", "hintSrt");
+
+function hintPayload() {
+  return JSON.stringify({ srt: $("hintSrt").value, hints: $("hintLines").value });
+}
+
+function showHintError(msg) {
+  $("hintMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("hintResult").innerHTML = "";
+  $("hintExportBtn").disabled = true;
+}
+
+function hintErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderHintPreview(pv) {
+  const placedRows = pv.placed.map(p => `
+    <tr>
+      <td>${p.row}</td>
+      <td class="mono">${escapeHtml(p.target)}</td>
+      <td class="mono">${escapeHtml(p.start)} --&gt; ${escapeHtml(p.end)}</td>
+      <td>${p.deviation_ms}</td>
+      <td>#${p.gap}</td>
+      <td class="mono">${escapeHtml(p.text)}</td>
+    </tr>`).join("");
+  const placedTable = pv.placed_count ? `<table>
+      <tr><th style="width:4em">提示行</th><th>目标起点</th><th>实际时间</th>
+      <th style="width:5em">偏差(ms)</th><th style="width:4em">空隙</th><th>正文</th></tr>
+      ${placedRows}
+    </table>` : `<div class="hint">没有任何提示被放入。</div>`;
+
+  const unplacedRows = pv.unplaced.map(u => `
+    <tr class="unmatched">
+      <td>${u.row}</td>
+      <td class="mono">${escapeHtml(u.target)}</td>
+      <td>${u.duration_ms}</td>
+      <td class="mono">${escapeHtml(u.text)}</td>
+    </tr>`).join("");
+  const unplacedTable = pv.unplaced_count ? `
+    <h3 style="font-size:14px;margin:12px 0 6px">未放入提示（${pv.unplaced_count} 条，不会写入导出文件）</h3>
+    <table>
+      <tr><th style="width:4em">提示行</th><th>目标起点</th><th style="width:6em">持续(ms)</th><th>正文</th></tr>
+      ${unplacedRows}
+    </table>` : "";
+
+  const gapRows = pv.gaps.map(g => `
+    <tr>
+      <td>#${g.seq}</td>
+      <td class="mono">${escapeHtml(g.prev_index)} → ${escapeHtml(g.next_index)}</td>
+      <td class="mono">${escapeHtml(g.start)} --&gt; ${escapeHtml(g.end)}</td>
+      <td>${g.duration_ms}</td>
+      <td>${g.used ? '<span class="merged-tag">已用</span>' : '<span class="hint">空闲</span>'}</td>
+    </tr>`).join("");
+  const gapTable = pv.gap_count ? `
+    <h3 style="font-size:14px;margin:12px 0 6px">正时长空隙（${pv.gap_count} 个，每个最多放一条）</h3>
+    <table>
+      <tr><th style="width:4em">空隙</th><th style="width:8em">相邻原序号</th><th>时间范围</th>
+      <th style="width:6em">时长(ms)</th><th style="width:5em">状态</th></tr>
+      ${gapRows}
+    </table>` : `<div class="hint">原字幕之间没有正时长空隙。</div>`;
+
+  $("hintResult").innerHTML =
+    `<h3 style="font-size:14px;margin:8px 0">已放入（${pv.placed_count} 条，总偏差 ${pv.total_deviation_ms} ms）</h3>` +
+    placedTable + unplacedTable + gapTable;
+
+  if (pv.placed_count === 0) {
+    $("hintMessage").innerHTML =
+      `<div class="bad-banner">✗ 字幕 ${pv.entry_count} 条 / 正时长空隙 ${pv.gap_count} 个 / 提示 ${pv.hint_count} 条，` +
+      `没有任何提示能放入空隙；导出的 SRT 将只含原字幕（按时间重编号）。</div>`;
+  } else {
+    $("hintMessage").innerHTML =
+      `<div class="ok-banner">✓ 字幕 ${pv.entry_count} 条 / 正时长空隙 ${pv.gap_count} 个 / 提示 ${pv.hint_count} 条；` +
+      `已放入 <strong>${pv.placed_count}</strong> 条（总偏差 ${pv.total_deviation_ms} ms）` +
+      (pv.unplaced_count ? `，${pv.unplaced_count} 条未放入` : "，全部放入") +
+      `，可以下载。</div>`;
+  }
+  $("hintExportBtn").disabled = false;
+}
+
+async function hintPreview() {
+  $("hintMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/hint/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: hintPayload(),
+    });
+  } catch (e) { return showHintError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderHintPreview(data);
+  return showHintError(hintErrDetail(data));
+}
+
+async function hintExport() {
+  let res;
+  try {
+    res = await fetch("/api/hint/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: hintPayload(),
+    });
+  } catch (e) { return showHintError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showHintError(hintErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "hinted.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }
