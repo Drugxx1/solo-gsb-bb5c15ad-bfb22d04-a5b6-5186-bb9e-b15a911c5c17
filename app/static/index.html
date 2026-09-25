@@ -360,6 +360,43 @@
   <div id="chResult"></div>
 </div>
 
+<hr class="feature-divider">
+<h1 id="gaphint">字幕空隙提示编排</h1>
+<p class="hint">粘贴或上传 SRT，并<strong>逐行填写提示</strong>（每行一条：<code>目标起点 | 持续毫秒 | 正文</code>，
+目标起点为 <code>HH:MM:SS,mmm</code>，持续毫秒为正整数，正文非空；空行跳过）。
+只使用<strong>相邻原字幕之间的正时长空隙</strong>（端点相触不算空隙，首条之前 / 末条之后也不放），<strong>每个空隙最多放一条</strong>提示。
+提示按<strong>目标起点、输入行号</strong>排序后做有序全局匹配：先<strong>最大化放入条数</strong>，再最小化<strong>实际起点与目标起点的绝对偏差之和</strong>，
+仍并列时选<strong>被占用空隙序号序列字典序最小</strong>的方案；每条提示的实际起点在所选空隙内夹到可用范围，放入后不与原字幕重叠、也不改变原字幕时间。
+字幕出现<strong>空时长、起止倒置或轨内重叠</strong>，或提示行<strong>时间非法、持续毫秒非正、正文为空</strong>都会直接报错。
+预览显示已放入位置与偏差、全部空隙占用情况及未放入提示；确认后下载<strong>按时间重编号</strong>的 SRT（原字幕正文与时间原样保留）。</p>
+
+<div class="card">
+  <h2>18. SRT 与逐行提示</h2>
+  <div class="track-grid">
+    <div class="track-box">
+      <h3>SRT 字幕
+        <input type="file" id="ghFile" accept=".srt,.txt" style="font-size:12px;font-weight:normal">
+      </h3>
+      <textarea id="ghSrt" placeholder="1&#10;00:00:01,000 --> 00:00:03,000&#10;第一句字幕&#10;&#10;2&#10;00:00:05,000 --> 00:00:07,000&#10;第二句字幕"></textarea>
+    </div>
+    <div class="track-box">
+      <h3>逐行提示（目标起点 | 持续毫秒 | 正文）</h3>
+      <textarea id="ghHints" style="min-height:200px" placeholder="00:00:03,500 | 1200 | 这里插入一条提示&#10;00:00:08,000 | 900 | 另一条提示"></textarea>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>19. 预览编排与下载 SRT</h2>
+  <div class="toolbar">
+    <button onclick="ghPreview()">预览编排结果</button>
+    <button id="ghExportBtn" onclick="ghExport()" disabled>下载编排后 SRT</button>
+    <span class="hint" id="ghExportHint">请先预览，校验通过后才能下载</span>
+  </div>
+  <div id="ghMessage"></div>
+  <div id="ghResult"></div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 
@@ -1306,6 +1343,113 @@ async function chapterExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "chapters.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 字幕空隙提示编排
+
+bindTrackFile("ghFile", "ghSrt");
+
+function ghPayload() {
+  return JSON.stringify({ srt: $("ghSrt").value, hints: $("ghHints").value });
+}
+
+function showGhError(msg) {
+  $("ghMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("ghResult").innerHTML = "";
+  $("ghExportBtn").disabled = true;
+}
+
+function ghErrDetail(data) {
+  if (!data || data.detail == null) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return data.detail.message || JSON.stringify(data.detail);
+}
+
+function renderGhPreview(pv) {
+  const placedTable = pv.placed_count ? `<table>
+      <tr><th style="width:4em">提示行</th><th style="width:9em">目标起点</th><th style="width:6em">持续(ms)</th>
+      <th style="width:5em">空隙#</th><th>实际起止</th><th style="width:6em">偏差(ms)</th><th>正文</th></tr>
+      ${pv.placed.map(p => `
+        <tr>
+          <td>${p.row}</td>
+          <td class="mono">${escapeHtml(p.target)}</td>
+          <td>${p.duration_ms}</td>
+          <td>${p.gap}</td>
+          <td class="mono">${escapeHtml(p.start)} --&gt; ${escapeHtml(p.end)}</td>
+          <td>${p.deviation_ms}</td>
+          <td class="mono">${escapeHtml(p.text)}</td>
+        </tr>`).join("")}
+    </table>` : `<div class="hint">没有任何提示被放入。</div>`;
+
+  const gapTable = pv.gap_count ? `
+    <h3 style="font-size:14px;margin:12px 0 6px">相邻原字幕空隙（${pv.gap_count} 个正时长空隙）</h3>
+    <table>
+      <tr><th style="width:4em">空隙#</th><th>空隙区间</th><th style="width:7em">时长(ms)</th><th style="width:8em">占用提示行</th></tr>
+      ${pv.gaps.map(g => `
+        <tr${g.hint_row == null ? "" : ' class="diff-row-split"'}>
+          <td>${g.seq}</td>
+          <td class="mono">${escapeHtml(g.start)} --&gt; ${escapeHtml(g.end)}</td>
+          <td>${g.duration_ms}</td>
+          <td>${g.hint_row == null ? '<span class="hint">（空）</span>' : `<strong>第 ${g.hint_row} 行</strong>`}</td>
+        </tr>`).join("")}
+    </table>` : `<div class="hint">原字幕之间没有任何正时长空隙，所有提示都无法放入。</div>`;
+
+  const unplacedBlock = pv.unplaced_count ? `
+    <div class="unmatched-list">
+      <h3 style="font-size:14px;margin:12px 0 6px">未放入提示（${pv.unplaced_count} 条：持续时长超过所有候选空隙，或空隙已被更优匹配占用）</h3>
+      <table>
+        <tr><th style="width:4em">提示行</th><th style="width:11em">目标起点</th><th style="width:7em">持续(ms)</th><th>正文</th></tr>
+        ${pv.unplaced.map(u => `
+          <tr class="unmatched">
+            <td>${u.row}</td>
+            <td class="mono">${escapeHtml(u.target)}</td>
+            <td>${u.duration_ms}</td>
+            <td class="mono">${escapeHtml(u.text)}</td>
+          </tr>`).join("")}
+      </table>
+    </div>` : "";
+
+  $("ghResult").innerHTML =
+    `<h3 style="font-size:14px;margin:8px 0 6px">已放入提示（${pv.placed_count} 条）</h3>` +
+    placedTable + gapTable + unplacedBlock;
+  $("ghMessage").innerHTML =
+    `<div class="ok-banner">✓ 原字幕 ${pv.entry_count} 条 / 正时长空隙 ${pv.gap_count} 个 / 提示 ${pv.hint_count} 条；` +
+    `放入 <strong>${pv.placed_count}</strong> 条、未放入 ${pv.unplaced_count} 条，` +
+    `实际起点与目标起点偏差合计 <strong>${pv.total_deviation_ms}</strong> ms，可以下载。</div>`;
+  $("ghExportBtn").disabled = false;
+}
+
+async function ghPreview() {
+  $("ghMessage").innerHTML = "";
+  let res;
+  try {
+    res = await fetch("/api/gaphint/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: ghPayload(),
+    });
+  } catch (e) { return showGhError("网络错误：" + e); }
+  const data = await res.json();
+  if (res.ok) return renderGhPreview(data);
+  return showGhError(ghErrDetail(data));
+}
+
+async function ghExport() {
+  let res;
+  try {
+    res = await fetch("/api/gaphint/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: ghPayload(),
+    });
+  } catch (e) { return showGhError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showGhError(ghErrDetail(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "gap_hints.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }

@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复 / 修订差异对照 / 目标词时间标记 / 字幕遮挡避让 / 字幕章节索引 / 字幕空隙提示编排")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -2312,4 +2312,260 @@ def chapter_export(req: ChapterRequest):
         content=b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8"),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="chapters.csv"'},
+    )
+
+
+# ---------------------------------------------------------------- 字幕空隙提示编排
+
+class GapHintRequest(BaseModel):
+    srt: str
+    hints: str  # 逐行提示，每行「目标起点 | 持续毫秒 | 正文」
+
+
+MAX_GAP_HINT_GRID = 1_000_000  # 提示数 × 空隙数 的有序匹配计算规模上限
+MAX_GAP_HINT_GAPS = 10_000     # 空隙数上限（匹配掩码宽度，保护大整数计算）
+
+
+def parse_gap_hints(text: str) -> List[dict]:
+    """逐行解析提示：目标起点 | 持续毫秒 | 正文。
+
+    空行跳过，行号取原始输入行号（1 起）；时间无法解析、持续毫秒不是
+    正整数或正文为空均抛 ValueError（并指明输入行号）。正文可含 '|'，
+    仅按前两个 '|' 切分。返回按 (目标起点, 输入行号) 排序的提示列表。
+    """
+    out = []
+    for row, line in enumerate(
+        text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), 1
+    ):
+        if not line.strip():
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                f"提示第 {row} 行：格式应为「目标起点 | 持续毫秒 | 正文」"
+            )
+        try:
+            target = parse_time(parts[0])
+        except ValueError as e:
+            raise ValueError(f"提示第 {row} 行：{e}")
+        dur_s = parts[1].strip()
+        if not dur_s.isdigit() or int(dur_s) <= 0:
+            raise ValueError(f"提示第 {row} 行：持续毫秒须为正整数")
+        body = parts[2].strip()
+        if not body:
+            raise ValueError(f"提示第 {row} 行：正文不能为空")
+        out.append({"row": row, "target": target, "dur": int(dur_s), "text": body})
+    if not out:
+        raise ValueError("请至少填写 1 条提示（每行：目标起点 | 持续毫秒 | 正文）")
+    out.sort(key=lambda h: (h["target"], h["row"]))
+    return out
+
+
+def find_subtitle_gaps(entries: List[dict]) -> List[tuple]:
+    """相邻原字幕之间的正时长空隙 [(start_ms, end_ms)]，按时间升序。
+
+    轨道校验已保证起点严格递增且不重叠；仅当后条起点 > 前条终点时
+    （端点相触不算）才是可用空隙。首尾（首条之前 / 末条之后）不放入。
+    """
+    gaps = []
+    for a, b in zip(entries, entries[1:]):
+        if b["start"] > a["end"]:
+            gaps.append((a["end"], b["start"]))
+    return gaps
+
+
+def plan_gap_hints(gaps: List[tuple], hints: List[dict]):
+    """空隙提示编排：提示到空隙的有序全局匹配。
+
+    提示已按 (目标起点, 输入行号) 排序、空隙按时间升序；匹配保持顺序
+    （被占用空隙序号随提示顺序严格递增），每个空隙至多放入一条提示。
+    提示放入空隙时实际起点夹到 [空隙起点, 空隙终点 - 持续毫秒] 内最接近
+    目标起点的位置，偏差 = |实际起点 - 目标起点|。
+
+    三级目标依次为：
+      1) 放入条数最多；
+      2) 实际起点与目标起点的绝对偏差之和最小；
+      3) 被占用空隙序号（1 起）序列字典序最小。
+    编码为单个整数取最大： 条数 × W1 − 偏差和 × W2 + 空隙掩码。
+    掩码把空隙 j（0 起）置于位 G-1-j：等条数的占用集合，其升序序号
+    序列字典序越小掩码越大（与双语合成 _weight_params 同理）；
+    W2 = 2**G 大于任何掩码，W1 = (偏差和上界 + 1) × W2 大于任何
+    「偏差和 × W2」之差，故比较顺序与三级目标一致。
+
+    保序网格 DP（滚动两行 + 标签回溯）：
+      跳过提示 i -> dp[i+1][j]；跳过空隙 j -> dp[i][j+1]；
+      放 i 入 j（容得下时）-> dp[i+1][j+1] + W1 - cost(i,j)*W2 + bit_j。
+    返回 (placed, unplaced)：placed 为 [(提示下标, 空隙下标, 实际起点ms)]
+    （按提示顺序），unplaced 为未放入提示下标（升序）。
+    """
+    H, G = len(hints), len(gaps)
+    if H == 0 or G == 0:
+        return [], list(range(H))
+    if G > MAX_GAP_HINT_GAPS or H * G > MAX_GAP_HINT_GRID:
+        raise ValueError(
+            f"提示数 × 空隙数 的匹配规模超限（{H} 条提示 × {G} 个空隙，"
+            f"上限 {MAX_GAP_HINT_GRID}，且空隙数 ≤ {MAX_GAP_HINT_GAPS}），"
+            "请减少提示条数或裁短字幕后重试"
+        )
+
+    dev_max = sum(max(h["target"], gaps[-1][1]) for h in hints)
+    W2 = 1 << G
+    W1 = (dev_max + 1) * W2
+    bit = [1 << (G - 1 - j) for j in range(G)]
+    g_start = [g[0] for g in gaps]
+    g_end = [g[1] for g in gaps]
+
+    TAG_MATCH, TAG_SKIP_HINT, TAG_SKIP_GAP = 1, 2, 3
+    tags = bytearray(H * G)
+    nxt = [0] * (G + 1)  # dp[i+1][j]；dp[·][G] 与 dp[H][·] 均为 0
+    for i in range(H - 1, -1, -1):
+        cur = [0] * (G + 1)
+        target, dur = hints[i]["target"], hints[i]["dur"]
+        base = i * G
+        for j in range(G - 1, -1, -1):
+            best, tag = nxt[j], TAG_SKIP_HINT  # 跳过提示 i
+            v = cur[j + 1]                     # 跳过空隙 j
+            if v >= best:  # 完全并列（含同一占用集合）时空隙留空优先于晚放入
+                best, tag = v, TAG_SKIP_GAP
+            if g_end[j] - g_start[j] >= dur:
+                lo, hi = g_start[j], g_end[j] - dur
+                if target < lo:
+                    cost = lo - target
+                elif target > hi:
+                    cost = target - hi
+                else:
+                    cost = 0
+                v = nxt[j + 1] + W1 - cost * W2 + bit[j]
+                if v >= best:  # 完全并列时优先放入当前（更早的）提示，结果确定
+                    best, tag = v, TAG_MATCH
+            cur[j] = best
+            tags[base + j] = tag
+        nxt = cur
+
+    placed = []
+    i = j = 0
+    while i < H and j < G:
+        tag = tags[i * G + j]
+        if tag == TAG_MATCH:
+            target, dur = hints[i]["target"], hints[i]["dur"]
+            actual = min(max(target, g_start[j]), g_end[j] - dur)
+            placed.append((i, j, actual))
+            i += 1
+            j += 1
+        elif tag == TAG_SKIP_HINT:
+            i += 1
+        else:  # TAG_SKIP_GAP
+            j += 1
+    placed_hints = {h for h, _, _ in placed}
+    unplaced = [h for h in range(H) if h not in placed_hints]
+    return placed, unplaced
+
+
+def _gaphint_prepare(req: "GapHintRequest"):
+    """空隙提示编排公共预处理：解析校验 SRT 轨道与逐行提示，失败抛 400。"""
+    try:
+        entries = parse_srt(req.srt)
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        hints = parse_gap_hints(req.hints)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, hints
+
+
+def _gaphint_plan(req: "GapHintRequest"):
+    """公共计算：校验、找正时长空隙、有序全局匹配。失败抛 400。"""
+    entries, hints = _gaphint_prepare(req)
+    gaps = find_subtitle_gaps(entries)
+    try:
+        placed, unplaced = plan_gap_hints(gaps, hints)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return entries, hints, gaps, placed, unplaced
+
+
+def _gaphint_hint_payload(h: dict) -> dict:
+    return {
+        "row": h["row"],
+        "target": fmt_time(h["target"]),
+        "target_ms": h["target"],
+        "duration_ms": h["dur"],
+        "text": h["text"],
+    }
+
+
+@app.post("/api/gaphint/preview")
+def gaphint_preview(req: GapHintRequest):
+    entries, hints, gaps, placed, unplaced_idx = _gaphint_plan(req)
+    gap_owner = {}
+    placed_items = []
+    total_dev = 0
+    for hi, gi, actual in placed:
+        hint = hints[hi]
+        dev = abs(actual - hint["target"])
+        total_dev += dev
+        gap_owner[gi] = hi
+        item = _gaphint_hint_payload(hint)
+        item.update({
+            "gap": gi + 1,
+            "start": fmt_time(actual),
+            "end": fmt_time(actual + hint["dur"]),
+            "start_ms": actual,
+            "end_ms": actual + hint["dur"],
+            "deviation_ms": dev,
+        })
+        placed_items.append(item)
+    gap_items = []
+    for seq, (gs, ge) in enumerate(gaps, 1):
+        owner = gap_owner.get(seq - 1)
+        gap_items.append({
+            "seq": seq,
+            "start": fmt_time(gs),
+            "end": fmt_time(ge),
+            "start_ms": gs,
+            "end_ms": ge,
+            "duration_ms": ge - gs,
+            "hint_row": hints[owner]["row"] if owner is not None else None,
+        })
+    return {
+        "entry_count": len(entries),
+        "gap_count": len(gaps),
+        "hint_count": len(hints),
+        "placed_count": len(placed_items),
+        "unplaced_count": len(unplaced_idx),
+        "total_deviation_ms": total_dev,
+        "placed": placed_items,
+        "unplaced": [_gaphint_hint_payload(hints[hi]) for hi in unplaced_idx],
+        "gaps": gap_items,
+    }
+
+
+@app.post("/api/gaphint/export")
+def gaphint_export(req: GapHintRequest):
+    entries, hints, _gaps, placed, _unplaced = _gaphint_plan(req)
+    # 原字幕保留原正文与时间，与已放入提示合并后按起点重编号
+    items = [
+        {"start": e["start"], "end": e["end"], "lines": e["lines"]}
+        for e in entries
+    ]
+    for hi, _gi, actual in placed:
+        hint = hints[hi]
+        items.append({
+            "start": actual,
+            "end": actual + hint["dur"],
+            "lines": [hint["text"]],
+        })
+    items.sort(key=lambda r: r["start"])
+    blocks = [
+        f"{n}\n{fmt_time(r['start'])} --> {fmt_time(r['end'])}\n"
+        + "\n".join(r["lines"] or [""])
+        for n, r in enumerate(items, 1)
+    ]
+    content = "\n\n".join(blocks) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="gap_hints.srt"'},
     )
